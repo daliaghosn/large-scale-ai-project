@@ -280,6 +280,23 @@ DATA_ARGS=(
     --num-workers 1
 )
 
+TORCH_COMPILE_ARGS=()
+if [ "${TORCH_COMPILE:-}" = "1" ] || [ "${TORCH_COMPILE:-}" = "true" ]; then
+    TORCH_COMPILE_ARGS+=(--torch-compile)
+    if [ -n "${TORCH_COMPILE_BACKEND:-}" ]; then
+        TORCH_COMPILE_ARGS+=(--torch-compile-backend "${TORCH_COMPILE_BACKEND}")
+    fi
+    if [ -n "${TORCH_COMPILE_MODE:-}" ]; then
+        TORCH_COMPILE_ARGS+=(--torch-compile-mode "${TORCH_COMPILE_MODE}")
+    fi
+    if [ "${TORCH_COMPILE_FULLGRAPH:-}" = "1" ] || [ "${TORCH_COMPILE_FULLGRAPH:-}" = "true" ]; then
+        TORCH_COMPILE_ARGS+=(--torch-compile-fullgraph)
+    fi
+    if [ "${TORCH_COMPILE_DYNAMIC:-}" = "1" ] || [ "${TORCH_COMPILE_DYNAMIC:-}" = "true" ]; then
+        TORCH_COMPILE_ARGS+=(--torch-compile-dynamic)
+    fi
+fi
+
 TORCHRUN_ARGS=(
     --nproc-per-node $SLURM_GPUS_PER_NODE
     --nnodes $SLURM_NNODES
@@ -298,6 +315,7 @@ TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
     ${INITIALIZATION_ARGS[@]} \
     ${MIXED_PRECISION_ARGS[@]} \
     ${DISTRIBUTED_ARGS[@]} \
+    ${TORCH_COMPILE_ARGS[@]} \
     ${LOGGING_ARGS[@]} \
     ${TOKENIZER_ARGS[@]} \
     ${DATA_ARGS[@]}"

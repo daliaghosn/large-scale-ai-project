@@ -1,0 +1,57 @@
+# Patch: Add optional torch.compile support for training
+#
+# Problem: There is no way to enable torch.compile for Megatron-LM training in this workspace,
+# which can leave throughput on the table for steady-state runs.
+#
+# Solution: Add CLI flags to enable torch.compile and optional compile settings, then
+# compile model modules after precision wrapping and before DDP/FSDP wrapping.
+#
+# Location:
+# - megatron/training/arguments.py: add torch.compile-related CLI flags in _add_training_args
+# - megatron/training/training.py: call torch.compile in get_model after amax correction
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index 46f3c28b1..2f4a3a9a6 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -2096,6 +2096,16 @@ def _add_training_args(parser):
+                        help='The communicator group names to use high priority streams.')
+     group.add_argument('--disable-jit-fuser', action='store_true',
+                        help='Disable the JIT fuser.')
++    group.add_argument('--torch-compile', action='store_true',
++                       help='Enable torch.compile on the model before DDP.')
++    group.add_argument('--torch-compile-backend', type=str, default=None,
++                       help='Backend for torch.compile (e.g., inductor).')
++    group.add_argument('--torch-compile-mode', type=str, default=None,
++                       help='Mode for torch.compile (e.g., default, reduce-overhead, max-autotune).')
++    group.add_argument('--torch-compile-fullgraph', action='store_true',
++                       help='Use fullgraph=True with torch.compile.')
++    group.add_argument('--torch-compile-dynamic', action='store_true',
++                       help='Use dynamic=True with torch.compile.')
+ 
+     return parser
+ 
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index d61b9357a..9a5e76134 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -1273,6 +1273,20 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
+     # After TE2.x: Below function is an empty function and does nothing.
+     correct_amax_history_if_needed(model)
+ 
++    if getattr(args, "torch_compile", False):
++        if not hasattr(torch, "compile"):
++            raise RuntimeError("torch.compile requested but not available in this PyTorch build.")
++        compile_kwargs = {}
++        if args.torch_compile_backend is not None:
++            compile_kwargs["backend"] = args.torch_compile_backend
++        if args.torch_compile_mode is not None:
++            compile_kwargs["mode"] = args.torch_compile_mode
++        if args.torch_compile_fullgraph:
++            compile_kwargs["fullgraph"] = True
++        if args.torch_compile_dynamic:
++            compile_kwargs["dynamic"] = True
++        model = [torch.compile(model_module, **compile_kwargs) for model_module in model]
++
+     if wrap_with_ddp:
+         if args.use_torch_fsdp2:
+             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
