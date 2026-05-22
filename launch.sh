@@ -39,7 +39,7 @@ case $MODE in
         NODES=${4:-4}
         TIME=02:30:00
         EVAL_INTERVAL=1000
-        EVAL_ITERS=10
+        EVAL_ITERS=50 #10
         LR_WARMUP_ITERS=200
         LOGGING_EXTRA="
     --tensorboard-dir \$TENSORBOARD_DIR
@@ -277,7 +277,7 @@ DATA_ARGS=(
     --data-path $DATA_PREFIX
     --data-cache-path $DATASET_CACHE_DIR
     --split 99,1,0
-    --num-workers 1
+    --num-workers 4
 )
 
 TORCHRUN_ARGS=(
