@@ -8,6 +8,7 @@
 #SBATCH --time=00:10:00
 #SBATCH --output=logs/%x-%j.log
 #SBATCH --error=logs/%x-%j.log
+#SBATCH --account=lsaie-ss26
 
 WORKDIR=${WORKDIR:-$SLURM_SUBMIT_DIR}
 

@@ -234,6 +234,7 @@ As we upgrade Megatron-LM to a new release version, we will attempt to apply all
 | Patch | Description |
 |-------|-------------|
 | `0001-log-tokens-per-sec-to-wandb.patch` | Logs tokens/sec/GPU to stdout, TensorBoard, and W&B |
+| `0002-add-torch-compile.patch` | Adds `--torch-compile` flags; compiles model in `get_model()` before DDP |
 
 ## References
 
