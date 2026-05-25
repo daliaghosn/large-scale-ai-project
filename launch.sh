@@ -14,10 +14,24 @@
 #            ./launch.sh throughput 8b 50 1
 #            ./launch.sh train 760m 5000
 #            ./launch.sh train 1.5b 3000 8
+#
+# Perf overrides:
+#   DTYPE=fp8 NUM_WORKERS=8 MANUAL_GC=0 MBS=20 ./launch.sh throughput 125m 50 1
+#   NO_SUBMIT=1 ...   # generate sbatch only
 
 set -euo pipefail
 
 source "$(dirname "$0")/config.sh"
+
+# Mixed precision: bf16 (default) or fp8 (TransformerEngine hybrid recipe).
+DTYPE=${DTYPE:-bf16}
+case $DTYPE in
+    bf16|fp8) ;;
+    *)
+        echo "Unknown DTYPE: $DTYPE. Use: bf16, fp8"
+        exit 1
+        ;;
+esac
 
 MODE=${1:?Usage: ./launch.sh <mode> <model_size> [steps] [nodes]}
 MODEL_SIZE=${2:?Usage: ./launch.sh <mode> <model_size> [steps] [nodes]}
@@ -38,8 +52,8 @@ case $MODE in
         TRAINING_STEPS=${3:?Usage: ./launch.sh train <model_size> <steps> [nodes]}
         NODES=${4:-4}
         TIME=02:30:00
-        EVAL_INTERVAL=1000
-        EVAL_ITERS=50 #10
+        EVAL_INTERVAL=200
+        EVAL_ITERS=10
         LR_WARMUP_ITERS=200
         LOGGING_EXTRA="
     --tensorboard-dir \$TENSORBOARD_DIR
@@ -54,6 +68,7 @@ case $MODE in
 esac
 
 ################ Model config ################
+REQ_MBS=${MBS:-}
 case $MODEL_SIZE in
     125m)
         NUM_LAYERS=12;  HIDDEN=768;  FFN=2048;  HEADS=12; KV_HEADS=4
@@ -85,9 +100,49 @@ case $MODEL_SIZE in
         ;;
 esac
 
+NUM_WORKERS=${NUM_WORKERS:-4}
+MANUAL_GC=${MANUAL_GC:-1}
+[ -n "$REQ_MBS" ] && MBS=$REQ_MBS
+
 GBS=256
 SEQ_LEN=4096
-JOB_NAME="gipfel-${MODE}-${MODEL_SIZE}-${TRAINING_STEPS}s-${NODES}n"
+
+PERF_TAG=""
+[ "$NUM_WORKERS" != "4" ] && PERF_TAG="${PERF_TAG}-w${NUM_WORKERS}"
+[ "$MANUAL_GC" = "0" ] && PERF_TAG="${PERF_TAG}-nogc"
+JOB_NAME="gipfel-${MODE}-${MODEL_SIZE}-${DTYPE}${PERF_TAG}-mbs${MBS}-${TRAINING_STEPS}s-${NODES}n"
+
+if [ "$MANUAL_GC" = "1" ]; then
+    TRAINING_GC_BLOCK='    --manual-gc
+    --manual-gc-interval 50'
+else
+    TRAINING_GC_BLOCK=''
+fi
+
+case $DTYPE in
+    bf16)
+        MIXED_PRECISION_BLOCK='MIXED_PRECISION_ARGS=(
+    --bf16
+)'
+        TRANSFORMER_ENGINE_BLOCK='TRANSFORMER_ENGINE_ARGS=(
+    --transformer-impl transformer_engine
+    --use-precision-aware-optimizer
+    --main-grads-dtype bf16
+)'
+        ;;
+    fp8)
+        MIXED_PRECISION_BLOCK='MIXED_PRECISION_ARGS=(
+    --bf16
+    --fp8-format hybrid
+    --fp8-amax-history-len 1024
+    --fp8-amax-compute-algo max
+    --fp8-param-gather
+)'
+        TRANSFORMER_ENGINE_BLOCK='TRANSFORMER_ENGINE_ARGS=(
+    --transformer-impl transformer_engine
+)'
+        ;;
+esac
 
 ################ W&B block ################
 if [ "$WANDB" = true ]; then
@@ -140,7 +195,7 @@ BODY_HEAD
 cat >> "$SCRIPT" << BODY_WORKDIR
 WORKDIR=${WORKDIR}
 MEGATRON_LM_DIR=\$WORKDIR/Megatron-LM
-DATA_PREFIX=/capstor/store/cscs/swissai/infra01/datasets/nvidia/Nemotron-ClimbMix/climbmix_small_megatron/climbmix_small
+DATA_PREFIX=/iopsstor/scratch/cscs/course_00312/climbmix_small
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/\$USER/gipfelsturm/cache
 BODY_WORKDIR
 
@@ -151,10 +206,11 @@ MBS=${MBS}
 GBS=${GBS}
 SEQ_LEN=${SEQ_LEN}
 TRAINING_STEPS=${TRAINING_STEPS}
+DTYPE=${DTYPE}
 
 # Logging
 PROJECT_NAME=gipfelsturm
-EXP_NAME=${MODE}-${MODEL_SIZE}-\${SLURM_NNODES}n
+EXP_NAME=${MODE}-${MODEL_SIZE}-${DTYPE}-\${SLURM_NNODES}n
 LOG_DIR=/iopsstor/scratch/cscs/\$USER/gipfelsturm/\$PROJECT_NAME/\$EXP_NAME
 TENSORBOARD_DIR=\$LOG_DIR/tensorboard
 CONFIGS
@@ -174,16 +230,16 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export TRITON_CACHE_DIR=/iopsstor/scratch/cscs/$USER/gipfelsturm/.triton_cache
 export TORCHINDUCTOR_CACHE_DIR=/iopsstor/scratch/cscs/$USER/gipfelsturm/.inductor_cache
 export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK/SLURM_GPUS_PER_NODE))
+echo "[\$(date)] DTYPE=\${DTYPE}"
 MASTER_ADDR=$(hostname)
 MASTER_PORT=25678
 
-TRANSFORMER_ENGINE_ARGS=(
-    --transformer-impl transformer_engine
-    --use-precision-aware-optimizer
-    --main-grads-dtype bf16
-)
-
 SETUP
+
+cat >> "$SCRIPT" << TRANSFORMER_ENGINE
+${TRANSFORMER_ENGINE_BLOCK}
+
+TRANSFORMER_ENGINE
 
 cat >> "$SCRIPT" << MODEL
 NETWORK_SIZE_ARGS=(
@@ -216,8 +272,8 @@ TRAINING_ARGS=(
     --optimizer adam
     --dataloader-type single
     --no-check-for-nan-in-loss-and-grad
-    --manual-gc
-    --manual-gc-interval 50
+${TRAINING_GC_BLOCK}
+    --use-flash-attn
 )
 
 REGULARIZATION_ARGS=(
@@ -243,9 +299,14 @@ INITIALIZATION_ARGS=(
     --init-method-std 0.02
 )
 
-MIXED_PRECISION_ARGS=(
-    --bf16
-)
+REST
+
+cat >> "$SCRIPT" << MIXED_PRECISION
+${MIXED_PRECISION_BLOCK}
+
+MIXED_PRECISION
+
+cat >> "$SCRIPT" << 'REST'
 
 DISTRIBUTED_ARGS=(
     --tensor-model-parallel-size 1
@@ -277,25 +338,8 @@ DATA_ARGS=(
     --data-path $DATA_PREFIX
     --data-cache-path $DATASET_CACHE_DIR
     --split 99,1,0
-    --num-workers 4
+    --num-workers ${NUM_WORKERS}
 )
-
-TORCH_COMPILE_ARGS=()
-if [ "${TORCH_COMPILE:-}" = "1" ] || [ "${TORCH_COMPILE:-}" = "true" ]; then
-    TORCH_COMPILE_ARGS+=(--torch-compile)
-    if [ -n "${TORCH_COMPILE_BACKEND:-}" ]; then
-        TORCH_COMPILE_ARGS+=(--torch-compile-backend "${TORCH_COMPILE_BACKEND}")
-    fi
-    if [ -n "${TORCH_COMPILE_MODE:-}" ]; then
-        TORCH_COMPILE_ARGS+=(--torch-compile-mode "${TORCH_COMPILE_MODE}")
-    fi
-    if [ "${TORCH_COMPILE_FULLGRAPH:-}" = "1" ] || [ "${TORCH_COMPILE_FULLGRAPH:-}" = "true" ]; then
-        TORCH_COMPILE_ARGS+=(--torch-compile-fullgraph)
-    fi
-    if [ "${TORCH_COMPILE_DYNAMIC:-}" = "1" ] || [ "${TORCH_COMPILE_DYNAMIC:-}" = "true" ]; then
-        TORCH_COMPILE_ARGS+=(--torch-compile-dynamic)
-    fi
-fi
 
 TORCHRUN_ARGS=(
     --nproc-per-node $SLURM_GPUS_PER_NODE
@@ -315,7 +359,6 @@ TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
     ${INITIALIZATION_ARGS[@]} \
     ${MIXED_PRECISION_ARGS[@]} \
     ${DISTRIBUTED_ARGS[@]} \
-    ${TORCH_COMPILE_ARGS[@]} \
     ${LOGGING_ARGS[@]} \
     ${TOKENIZER_ARGS[@]} \
     ${DATA_ARGS[@]}"
@@ -341,5 +384,9 @@ FOOTER
 
 chmod +x "$SCRIPT"
 
-echo "Generated: $SCRIPT"
-sbatch "$SCRIPT"
+echo "Generated: $SCRIPT (DTYPE=${DTYPE} NUM_WORKERS=${NUM_WORKERS} MANUAL_GC=${MANUAL_GC} MBS=${MBS})"
+if [ "${NO_SUBMIT:-0}" = "1" ]; then
+    echo "NO_SUBMIT=1 — sbatch skipped."
+else
+    sbatch "$SCRIPT"
+fi
